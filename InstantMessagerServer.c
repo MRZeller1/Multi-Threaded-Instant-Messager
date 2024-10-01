@@ -31,6 +31,10 @@ bool serverRunning = true;
 bool chatStarted = false;
 int usercount = 0;
 
+// Mutex for managing shared resources
+pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t poll_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // Poll variables
 char pollQuestion[MAXLEN];
 char pollAnswers[10][200];
@@ -42,16 +46,19 @@ bool pollActive = false;
 void sighandler(int signum) {
     printf("Received SIGINT signal. Shutting down the server.\n");
     serverRunning = false;
+    pthread_mutex_lock(&client_mutex);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clientfds[i] != 0) {
             close(clientfds[i]);
             clientfds[i] = 0;
         }
     }
+    pthread_mutex_unlock(&client_mutex);
 }
 
 // Poll handler to process and announce poll results
 void pollHandler(int signo) {
+    pthread_mutex_lock(&poll_mutex);
     pollActive = false;
     char result[MAXLEN] = "The results are in!\n";
     strcat(result, pollQuestion);
@@ -62,11 +69,15 @@ void pollHandler(int signo) {
         strcat(result, pollAnswers[i]);
         strcat(result, numberString);
     }
+    pthread_mutex_unlock(&poll_mutex);
+
+    pthread_mutex_lock(&client_mutex);
     for (int i = 0; i < usercount; i++) {
         if (active[i]) {
             write(clientfds[i], result, strlen(result));
         }
     }
+    pthread_mutex_unlock(&client_mutex);
 }
 
 // Function to handle client communication
@@ -74,6 +85,7 @@ void *clientHandler(void *ptr) {
     uint32_t connfd = (uint32_t)ptr;
     int index = -1;
 
+    pthread_mutex_lock(&client_mutex);
     // Assign client to an available slot
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clientfds[i] == 0) {
@@ -85,6 +97,7 @@ void *clientHandler(void *ptr) {
 
     // If server is full
     if (index == -1) {
+        pthread_mutex_unlock(&client_mutex);
         close(connfd);
         fprintf(stderr, "Too many clients.\n");
         return NULL;
@@ -92,6 +105,7 @@ void *clientHandler(void *ptr) {
 
     usercount++;
     active[index] = true;
+    pthread_mutex_unlock(&client_mutex);
 
     // Prompt client for their name
     char *prompt = "Enter your name: \n";
@@ -128,18 +142,21 @@ void *clientHandler(void *ptr) {
 
         // Handle 'list' command: List active users
         if (strcmp(command, "list") == 0) {
+            pthread_mutex_lock(&client_mutex);
             for (int i = 0; i < usercount; i++) {
                 if (active[i]) {
                     strcat(userList, clientNames[i]);
                     strcat(userList, " ");
                 }
             }
+            pthread_mutex_unlock(&client_mutex);
             write(connfd, userList, strlen(userList));
             write(connfd, "\n", 1);
 
         // Handle 'send' command: Send private message
         } else if (strcmp(command, "send") == 0 && sscanf(buffer, "%s %s %[^\n]", command, senduser, message) == 3) {
             bool userFound = false;
+            pthread_mutex_lock(&client_mutex);
             for (int i = 0; i < usercount; i++) {
                 if (strcmp(clientNames[i], senduser) == 0) {
                     if (active[i]) {
@@ -156,6 +173,7 @@ void *clientHandler(void *ptr) {
                     break;
                 }
             }
+            pthread_mutex_unlock(&client_mutex);
             if (!userFound) {
                 char sorryMessage[MAXLEN] = "Sorry, ";
                 strcat(sorryMessage, senduser);
@@ -165,10 +183,11 @@ void *clientHandler(void *ptr) {
 
         // Handle 'broadcast' command: Broadcast message to all users
         } else if (strcmp(command, "broadcast") == 0 && sscanf(buffer, "%s %[^\n]", command, message) == 2) {
+            pthread_mutex_lock(&client_mutex);
             if (active[index]) {
+                sprintf(sentmessage, "%s says: %s\n", clientNames[index], message);
                 for (int i = 0; i < usercount; i++) {
                     if (active[i] && i != index) {
-                        sprintf(sentmessage, "%s says: %s\n", clientNames[index], message);
                         write(clientfds[i], sentmessage, strlen(sentmessage));
                     }
                 }
@@ -176,6 +195,7 @@ void *clientHandler(void *ptr) {
             } else {
                 write(connfd, "You are not active.\n", 20);
             }
+            pthread_mutex_unlock(&client_mutex);
 
         // Handle 'close' command: Quit the chat
         } else if (strcmp(command, "close") == 0) {
@@ -183,7 +203,9 @@ void *clientHandler(void *ptr) {
 
         // Handle 'poll' command: Start a poll
         } else if (strcmp(command, "poll") == 0) {
+            pthread_mutex_lock(&poll_mutex);
             if (pollActive) {
+                pthread_mutex_unlock(&poll_mutex);
                 write(connfd, "Poll is currently active.\n", 26);
                 continue;
             }
@@ -204,11 +226,14 @@ void *clientHandler(void *ptr) {
             signal(SIGALRM, pollHandler);
             alarm(90); // Poll lasts 90 seconds
             pollActive = true;
+            pthread_mutex_unlock(&poll_mutex);
 
         // Handle 'vote' command: Vote on the current poll
         } else if (strcmp(command, "vote") == 0) {
             int voteIndex;
+            pthread_mutex_lock(&poll_mutex);
             if (!pollActive) {
+                pthread_mutex_unlock(&poll_mutex);
                 write(connfd, "No active polls.\n", 17);
                 continue;
             }
@@ -216,10 +241,12 @@ void *clientHandler(void *ptr) {
             read(connfd, buffer, sizeof(buffer));
             sscanf(buffer, "%d", &voteIndex);
             if (voteIndex < 1 || voteIndex > answersCount) {
+                pthread_mutex_unlock(&poll_mutex);
                 write(connfd, "Invalid vote.\n", 14);
                 continue;
             }
             pollCount[voteIndex - 1]++;
+            pthread_mutex_unlock(&poll_mutex);
             write(connfd, "Vote recorded.\n", 15);
 
         // Handle 'commands' command: List available commands
@@ -237,9 +264,12 @@ void *clientHandler(void *ptr) {
     }
 
     // Cleanup when client disconnects
+    pthread_mutex_lock(&client_mutex);
     active[index] = false;
-    close(connfd);
     clientfds[index] = 0;
+    usercount--;
+    pthread_mutex_unlock(&client_mutex);
+    close(connfd);
     return NULL;
 }
 
@@ -252,6 +282,7 @@ void *startChat(void *ptr) {
 
 int main() {
     int listenfd = 0;
+    struct sockaddr_in serv_addr;
     pthread_t managerThread;
 
     if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
